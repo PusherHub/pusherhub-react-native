@@ -1,6 +1,6 @@
 /**
- * PusherHub push notification + in-app messaging client for React Native
- * (Android — see the note at the bottom of this file for iOS).
+ * PusherHub push notification + in-app messaging client for React Native,
+ * on Android and iOS (see the note at the bottom of this file for iOS setup).
  *
  * Required setup (this is the whole "core" tier — everything else in this
  * file is optional):
@@ -47,10 +47,12 @@ import {
   Modal,
   NativeModules,
   Platform,
+  StatusBar,
   StyleSheet,
   Text,
   TouchableOpacity,
   TouchableWithoutFeedback,
+  TurboModuleRegistry,
   View,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
@@ -64,6 +66,9 @@ import {
   onNotificationOpenedApp,
   getInitialNotification,
   setBackgroundMessageHandler,
+  registerDeviceForRemoteMessages,
+  isDeviceRegisteredForRemoteMessages,
+  getAPNSToken,
 } from '@react-native-firebase/messaging';
 import notifee, { AndroidImportance, AuthorizationStatus, EventType } from '@notifee/react-native';
 
@@ -103,6 +108,13 @@ let initialized = false;
 
 let currentToken = null;
 let currentExternalId = null;
+// Settles once registerDevice() has registered this launch's token, so
+// PusherHubMessageHost's first check on app open waits for it rather than
+// finding no token yet and skipping until the next resume.
+let markRegistered;
+const registered = new Promise((resolve) => {
+  markRegistered = resolve;
+});
 let appStateSubscription = null;
 let tokenRefreshUnsubscribe = null;
 let heartbeatTimer = null;
@@ -172,17 +184,31 @@ async function registerDevice(externalId) {
 
   await requestNotificationPermissionIfNeeded();
 
+  // An iPhone gets an FCM token only once Apple's push service has given
+  // the app its own (APNs) token — asked for sooner, getToken() fails.
+  if (Platform.OS === 'ios' && !(await waitForApnsToken())) {
+    console.warn(
+      '[PusherHub] No APNs token from Apple — check the Push Notifications capability (aps-environment ' +
+        'entitlement) and that your APNs key is uploaded in Firebase (see the SDK Integration tab).',
+    );
+    return;
+  }
+
   let token;
   try {
     // Throws if Firebase isn't set up for this build (no
-    // google-services.json, or the com.google.gms.google-services plugin
-    // not applied) — caught here so a missing/incomplete Firebase setup
-    // logs a clear, actionable message instead of an unhandled rejection.
+    // google-services.json / GoogleService-Info.plist, or the Firebase
+    // setup not finished) — caught here so a missing/incomplete Firebase
+    // setup logs a clear, actionable message instead of an unhandled
+    // rejection.
     token = await getToken(messagingInstance());
   } catch (e) {
     console.warn(
-      '[PusherHub] Failed to get an FCM token — check that google-services.json is present and the ' +
-        'com.google.gms.google-services plugin is applied (see the SDK Integration tab).',
+      Platform.OS === 'ios'
+        ? '[PusherHub] Failed to get an FCM token — check that GoogleService-Info.plist is in the app ' +
+            '(see the SDK Integration tab).'
+        : '[PusherHub] Failed to get an FCM token — check that google-services.json is present and the ' +
+            'com.google.gms.google-services plugin is applied (see the SDK Integration tab).',
       e,
     );
     return;
@@ -192,8 +218,36 @@ async function registerDevice(externalId) {
   // Read now, not when registerDevice() was called: a login() or logout()
   // while the token was on its way counts.
   await registerToken(await resolvedExternalId(), token);
+  markRegistered();
   observeTokenRefresh();
   observeAppState();
+}
+
+/**
+ * iOS: registers for remote notifications (a no-op when
+ * @react-native-firebase already did at launch) and waits up to 10 seconds
+ * for Apple's APNs token, which FCM needs before it hands out its own.
+ * False if it never came — no push entitlement, or no network.
+ */
+async function waitForApnsToken() {
+  const messagingApp = messagingInstance();
+
+  try {
+    // @react-native-firebase registers at launch by itself unless an app
+    // turned that off — and warns when asked again for nothing.
+    if (!isDeviceRegisteredForRemoteMessages(messagingApp)) {
+      await registerDeviceForRemoteMessages(messagingApp);
+    }
+  } catch (e) {
+    console.warn('[PusherHub] Failed to register for remote notifications.', e);
+    return false;
+  }
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (await getAPNSToken(messagingApp)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
 }
 
 /**
@@ -249,12 +303,20 @@ async function collectDeviceMetadata() {
     return;
   }
 
-  const locale = (NativeModules.I18nManager && NativeModules.I18nManager.localeIdentifier) || 'en_US';
+  // Intl as the fallback: not every React Native build exposes
+  // I18nManager through NativeModules.
+  const locale =
+    (NativeModules.I18nManager && NativeModules.I18nManager.localeIdentifier) ||
+    Intl.DateTimeFormat().resolvedOptions().locale ||
+    'en_US';
   const [language, country] = locale.replace('-', '_').split('_');
+  // Core React Native gives no iPhone model name (that needs
+  // react-native-device-info), so an iOS device is just "iPhone" or "iPad".
+  const ios = Platform.OS === 'ios';
 
   deviceMetadata = {
-    device: Platform.constants?.Model ?? null,
-    brand: Platform.constants?.Brand ?? Platform.constants?.Manufacturer ?? null,
+    device: ios ? (Platform.constants?.interfaceIdiom === 'pad' ? 'iPad' : 'iPhone') : (Platform.constants?.Model ?? null),
+    brand: ios ? 'Apple' : (Platform.constants?.Brand ?? Platform.constants?.Manufacturer ?? null),
     // App version isn't exposed by core RN/Platform — install
     // react-native-device-info and set this from getVersion() yourself if
     // you need it; left null here to keep this SDK's dependency list short.
@@ -403,12 +465,21 @@ async function showNotification(remoteMessage) {
   // backend always sends both a notification and a data block (see
   // FcmService::deliver() server-side); notification_id/deep_link (used
   // for tap tracking, see handleNotificationOpened) live on .data.
+  // On an iPhone FCM passes the notification's image along as fcmOptions.image.
+  const iosImage = remoteMessage.fcmOptions?.image;
+
   await notifee.displayNotification({
     title: remoteMessage.notification?.title,
     body: remoteMessage.notification?.body,
     android: {
       channelId: NOTIFICATION_CHANNEL_ID,
       pressAction: { id: 'default' },
+    },
+    ios: {
+      sound: 'default',
+      // Shown as a banner even though the app is open, as on Android.
+      foregroundPresentationOptions: { banner: true, list: true, sound: true, badge: true },
+      ...(iosImage ? { attachments: [{ url: iosImage }] } : {}),
     },
     data: remoteMessage.data ?? {},
   });
@@ -461,7 +532,7 @@ async function registerToken(externalId, token) {
       // Covers both ways a rotation arrives: onTokenRefresh while running,
       // and getToken() returning a different token on a later launch.
       ...(previousToken && previousToken !== token ? { previous_token: previousToken } : {}),
-      platform: 'android',
+      platform: Platform.OS === 'ios' ? 'ios' : 'android',
       device: deviceMetadata.device,
       brand: deviceMetadata.brand,
       version: deviceMetadata.version,
@@ -819,6 +890,27 @@ function HtmlContent({ message, onAction }) {
 }
 
 /**
+ * How far the screen's own bars reach in, since a message's Modal covers the
+ * whole screen, bars included. Core React Native has no safe-area API and
+ * this SDK adds no dependency for one: Android reports its status bar's
+ * height; on an iPhone the status bar's height stands in for the top inset,
+ * and a tall one (the Face ID models' notch or Dynamic Island) means a home
+ * indicator along the bottom too.
+ */
+function screenInsets() {
+  if (Platform.OS === 'android') return { top: StatusBar.currentHeight ?? 0, bottom: 0 };
+
+  let height = 0;
+  try {
+    const statusBarManager = TurboModuleRegistry.get('StatusBarManager') ?? NativeModules.StatusBarManager;
+    height = statusBarManager?.getConstants?.().HEIGHT ?? 0;
+  } catch {
+    height = 0;
+  }
+  return { top: height, bottom: height >= 44 ? 34 : 0 };
+}
+
+/**
  * onExplicitClose fires for a user action that counts as "acted on" —
  * the close (✕) button, or a button/block with no deep link — none of
  * which should also report a dismiss. onImplicitDismiss fires for
@@ -831,6 +923,8 @@ function HtmlContent({ message, onAction }) {
 function InAppMessageOverlay({ message, onExplicitClose, onImplicitDismiss, onDeepLink }) {
   const isFullscreen = message.type === 'fullscreen';
   const textColor = colorOrDefault(message.text_color, '#0F172A');
+  const insets = screenInsets();
+  const cardPadding = message.content_mode === 'html' ? 0 : typeof message.padding === 'number' ? message.padding : 16;
 
   const handleAction = (action) => {
     if (action.type === 'close') {
@@ -850,6 +944,10 @@ function InAppMessageOverlay({ message, onExplicitClose, onImplicitDismiss, onDe
           {
             justifyContent: message.type === 'banner' ? 'flex-start' : message.type === 'bottom_sheet' ? 'flex-end' : 'center',
             padding: isFullscreen ? 0 : 8,
+            // Clear of the status bar (and an iPhone's notch or Dynamic
+            // Island) at the top, and of the home indicator at the bottom.
+            ...(message.type === 'banner' ? { paddingTop: 8 + insets.top } : {}),
+            ...(message.type === 'bottom_sheet' ? { paddingBottom: 8 + insets.bottom } : {}),
           },
         ]}
       >
@@ -864,7 +962,9 @@ function InAppMessageOverlay({ message, onExplicitClose, onImplicitDismiss, onDe
             {
               backgroundColor: colorOrDefault(message.background_color, '#FFFFFF'),
               borderRadius: isFullscreen ? 0 : 16,
-              padding: message.content_mode === 'html' ? 0 : typeof message.padding === 'number' ? message.padding : 16,
+              padding: cardPadding,
+              // A full-screen message keeps its content between the bars.
+              ...(isFullscreen ? { paddingTop: cardPadding + insets.top, paddingBottom: cardPadding + insets.bottom } : {}),
             },
             isFullscreen && styles.cardFullscreen,
           ]}
@@ -880,7 +980,7 @@ function InAppMessageOverlay({ message, onExplicitClose, onImplicitDismiss, onDe
             <SimpleContent message={message} textColor={textColor} onAction={handleAction} />
           )}
           {message.show_close_button !== false && (
-            <TouchableOpacity style={styles.closeButton} onPress={onExplicitClose}>
+            <TouchableOpacity style={[styles.closeButton, isFullscreen && { top: 4 + insets.top }]} onPress={onExplicitClose}>
               <Text style={{ color: textColor, fontSize: 16 }}>✕</Text>
             </TouchableOpacity>
           )}
@@ -916,6 +1016,8 @@ function PusherHubMessageHost({ children }) {
   };
 
   const checkForMessages = useCallback(async () => {
+    // On app open this runs before registerDevice() has a token; wait for it.
+    await registered;
     const messages = await fetchInAppMessages();
     if (messages.length === 0) return;
 
@@ -1077,9 +1179,12 @@ const PusherHub = {
 export default PusherHub;
 export { PusherHubMessageHost };
 
-// iOS note: this file's Android-specific bits are the notifee channel
-// creation (harmless no-op on iOS) and the POST_NOTIFICATIONS permission
-// request (requestPermission() already branches correctly per platform).
-// What's NOT done here: APNs entitlements/capabilities in Xcode, and
-// registering for remote notifications — see @react-native-firebase's iOS
-// setup docs. This SDK has only been exercised on Android so far.
+// iOS note: the code here covers both platforms — registerDevice() waits
+// for Apple's APNs token before asking FCM for one, and reports the device
+// as 'ios'. What it can't do from JavaScript is the app's own setup: the
+// Push Notifications capability and Background Modes > Remote
+// notifications in Xcode (an Expo app: aps-environment and
+// UIBackgroundModes in app.json), GoogleService-Info.plist, dynamic
+// frameworks in the Podfile, and the APNs key uploaded in Firebase — see the
+// SDK Integration tab. Images in notifications that arrive while the app is
+// closed need the Notification Service Extension from that tab too.
