@@ -115,6 +115,12 @@ let markRegistered;
 const registered = new Promise((resolve) => {
   markRegistered = resolve;
 });
+// Settles once initialize() has run — for a tap that launched the app,
+// which arrives first.
+let markInitialized;
+const initializedOnce = new Promise((resolve) => {
+  markInitialized = resolve;
+});
 let appStateSubscription = null;
 let tokenRefreshUnsubscribe = null;
 let heartbeatTimer = null;
@@ -158,6 +164,7 @@ async function initialize({ appKey: key, publicKey: pubKey, baseUrl: url, onNoti
   baseUrl = url;
   onNotificationClick = onClick ?? null;
   initialized = true;
+  markInitialized();
 
   if (Platform.OS === 'android') {
     await notifee.createChannel({
@@ -485,7 +492,7 @@ async function showNotification(remoteMessage) {
   });
 }
 
-function handleNotificationOpened(data) {
+async function handleNotificationOpened(data) {
   const notificationId = data?.notification_id;
   const deepLink = data?.deep_link;
   if (!notificationId) return;
@@ -493,6 +500,9 @@ function handleNotificationOpened(data) {
   trackEvent('track-open', notificationId);
   if (deepLink) {
     trackEvent('track-click', notificationId);
+    // A tap that launched the app comes before initialize(), which brings
+    // the app's own onNotificationClick, if it has one.
+    await initializedOnce;
     openDeepLink(deepLink);
   }
 }
@@ -506,7 +516,17 @@ function openDeepLink(deepLink) {
 }
 
 async function trackEvent(endpoint, notificationId) {
-  if (!currentToken) {
+  // A tap that launched the app arrives before initialize() and
+  // registerDevice() have run, and was lost: once initialized, report it
+  // with the token the backend took last time; before that, or with none
+  // saved yet, wait for this launch's registration.
+  let token = currentToken;
+  if (!token && initialized) token = await AsyncStorage.getItem(PREFS_KEY_LAST_REGISTERED_TOKEN);
+  if (!token) {
+    await registered;
+    token = currentToken;
+  }
+  if (!token) {
     console.warn(`[PusherHub] Skipping ${endpoint} — no FCM token registered yet.`);
     return;
   }
@@ -514,7 +534,7 @@ async function trackEvent(endpoint, notificationId) {
     await postJson(`${baseUrl}/${endpoint}`, {
       app_key: appKey,
       notification_id: Number.isNaN(Number(notificationId)) ? notificationId : Number(notificationId),
-      token: currentToken,
+      token,
     });
   } catch (e) {
     console.warn(`[PusherHub] Failed to send ${endpoint}`, e);
