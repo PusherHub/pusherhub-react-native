@@ -104,7 +104,18 @@ let appKey = null;
 let publicKey = null;
 let baseUrl = null;
 let onNotificationClick = null;
+let onNotificationOpened = null;
 let initialized = false;
+
+// Taps already handled this launch, by notification id: with notifee
+// installed, one tap can reach more than one of the listeners in
+// attachNotificationHandlers(). Each run of a recurring notification is a
+// notification of its own, so an id is only ever tapped once.
+const handledTaps = new Set();
+
+// What PusherHub itself puts in a push's data next to the Custom Data —
+// left out of what onNotificationOpened gets.
+const OWN_DATA_KEYS = ['notification_id', 'click_action', 'deep_link'];
 
 let currentToken = null;
 let currentExternalId = null;
@@ -150,19 +161,28 @@ function messagingInstance() {
  * registerDevice() would fail with nothing obviously wrong in your own
  * code.
  *
- * @param {{appKey: string, publicKey: string, baseUrl: string, onNotificationClick?: (deepLink: string) => void}} config
+ * @param {{appKey: string, publicKey: string, baseUrl: string, onNotificationClick?: (deepLink: string) => void, onNotificationOpened?: (data: Object<string, string>) => void}} config
  *   baseUrl: your PusherHub server's API base URL: "https://pusherhub.com/api"
  *   for apps on pusherhub.com — the dashboard's SDK Integration tab shows it
  *   filled in.
  *   onNotificationClick: optional — called instead of this SDK's default
  *   behavior (opening the link via Linking.openURL) when a tapped
  *   notification carries a deep link.
+ *   onNotificationOpened: optional — called on every tap of a PusherHub
+ *   notification, whether the app was open, in the background or closed,
+ *   with the Custom Data it was sent with (empty if it had none). Open the
+ *   right screen from it, e.g. data.campaign_id. Values arrive as text —
+ *   {"campaign_id": 232} gives "232" — and a nested object or list as its
+ *   JSON. A tap that launched the app arrives once initialize() has run,
+ *   which can be before your navigation is ready: keep the data and
+ *   navigate once it is.
  */
-async function initialize({ appKey: key, publicKey: pubKey, baseUrl: url, onNotificationClick: onClick } = {}) {
+async function initialize({ appKey: key, publicKey: pubKey, baseUrl: url, onNotificationClick: onClick, onNotificationOpened: onOpened } = {}) {
   appKey = key;
   publicKey = pubKey;
   baseUrl = url;
   onNotificationClick = onClick ?? null;
+  onNotificationOpened = onOpened ?? null;
   initialized = true;
   markInitialized();
 
@@ -408,7 +428,8 @@ async function trackInAppEvent(endpoint, inAppMessageId) {
 // wires all of them to the same two behaviors: build+show a system
 // notification while foregrounded (the OS does this automatically while
 // backgrounded/killed, matching the native SDKs' behavior), and report
-// open/click + follow the deep link on any tap, from any state.
+// open/click, hand over the Custom Data and follow the deep link on any
+// tap, from any state.
 // ---------------------------------------------------------------------
 
 /**
@@ -495,16 +516,31 @@ async function showNotification(remoteMessage) {
 async function handleNotificationOpened(data) {
   const notificationId = data?.notification_id;
   const deepLink = data?.deep_link;
-  if (!notificationId) return;
+  if (!notificationId || handledTaps.has(String(notificationId))) return;
+  handledTaps.add(String(notificationId));
 
   trackEvent('track-open', notificationId);
-  if (deepLink) {
-    trackEvent('track-click', notificationId);
-    // A tap that launched the app comes before initialize(), which brings
-    // the app's own onNotificationClick, if it has one.
-    await initializedOnce;
-    openDeepLink(deepLink);
-  }
+  if (deepLink) trackEvent('track-click', notificationId);
+
+  // A tap that launched the app comes before initialize(), which brings
+  // the app's own onNotificationOpened and onNotificationClick, if it has them.
+  await initializedOnce;
+  onNotificationOpened?.(customDataOf(data));
+  if (deepLink) openDeepLink(deepLink);
+}
+
+/**
+ * A tapped notification's Custom Data: the push's data, without
+ * PusherHub's own keys and any Firebase or iOS adds (gcm.*, google.*,
+ * aps, fcm_options) — every value as text.
+ */
+function customDataOf(data) {
+  return Object.fromEntries(
+    Object.entries(data ?? {})
+      .filter(([key]) => !OWN_DATA_KEYS.includes(key) && key !== 'aps' && key !== 'fcm_options'
+        && !key.startsWith('gcm.') && !key.startsWith('google.'))
+      .map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]),
+  );
 }
 
 function openDeepLink(deepLink) {
