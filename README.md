@@ -1,6 +1,6 @@
-# PusherHub React Native SDK
+# PusherHub React Native SDK — push notifications for Android and iOS
 
-Push notifications and in-app messages for your React Native app on **Android and iOS**, sent through your own Firebase project with [PusherHub](https://pusherhub.com).
+Push notifications and in-app messages for your React Native app on **Android and iOS** (Expo too): a free push notification service that sends through your own Firebase project — Firebase Cloud Messaging (FCM) for Android and the Apple Push Notification service (APNs) for iPhones — with [PusherHub](https://pusherhub.com).
 
 [Website](https://pusherhub.com) · [Guides](https://pusherhub.com/docs) · [Pricing](https://pusherhub.com/pricing)
 
